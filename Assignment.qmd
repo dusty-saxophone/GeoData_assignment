@@ -1,0 +1,599 @@
+---
+title: "Assignment"
+format: html
+editor: visual
+---
+
+# Computing Assignment: Geo-data and Methods in R
+
+Link to anonymous GitHub repository: <https://github.com/dusty-saxophone/GeoData_assignment>
+
+## Introduction
+
+A symbiosis is a close and long term interaction between two different species. There are several different types of symbiotic interactions which are categorised based on fitness benefits to each of the species - positive effect, no effect, or negative effect. By studying species overlaps, information can be gained about the strength of interspecific symbiotic interactions and may facilitate the identification of habitats critical to both species and aid conservation efforts. In this assignment, species ranges will be predicted by a model using known species locality data from the Global Biodiversity Information Facility, GBIF (<https://www.gbif.org>), and environmental data from Worldclim ([https://www.worldclim.org](#0)). By selecting the bioclimatic variables which best explain the species locality data, they can be used to predict a species presence or absence in a different location. In addition, by using models which predict how bioclimatic variables will change in the future, future species distributions and overlaps can also be predicted. The model which will be used is the Coupled Model Intercomparison Project Phase 5 (CMIP5) for the years 2061-2080.
+
+The two species I will be looking at are the puma (*Puma concolor*) and the moose (*Alces alces*). Pumas are known predators of moose, preferring to feed on large mammals including moose, mule deer, and white-tailed deer. In 2017, only two subspecies of cougar were considered to be valid by the IUCN Cat Specialist Group, the North American Puma (*P. concolor couguar*) and the South American Puma (*P. concolor concolor*). I will be focusing on the North American subspecies and will be limiting my distributions to the USA and Canada where cougars and moose are both present.
+
+## 1. Species 1 Distribution Modelling - Puma concolor
+
+```{r}
+#| message: false
+
+library(here) # Manages file paths relative to project directory
+library(dismo) # Functions for modelling species distribution 
+library(rworldmap) # World map
+library(sf) # Used for spatial data
+library(geodata) # Functions for downloading geographic data for use in spatial analysis. including climate data
+
+# Obtain a low resolution world map
+wrld_simpl <- getMap(resolution = "coarse")
+```
+
+#### 1.1 Function to access species records from GBIF
+
+```{r}
+#' Function which gets species data from GBIF
+#' 
+#' @param genus genus name of species to obtain gbif spatial data for
+#' @param species species name of species to obtain gbif spatial data for
+#' 
+#' @return saves and reads gbif file
+
+
+get_species_gbif <- function(genus, species) {
+  
+  # Genus and species in single string separated by underscore
+  species_name <- paste(genus, species, sep = "_") 
+  
+  # Save in project directory using the species name
+  species.gbif_file <- here(paste0(species_name,".gbif.rds"))
+  
+  # If the file does not exist fetch data using gbif
+  # If the file already exists read it
+  if(!file.exists(species.gbif_file)) {
+  species.gbif <- gbif(genus, species, geo = TRUE)
+  saveRDS(species.gbif, species.gbif_file)
+  } else {
+  species.gbif <- readRDS(species.gbif_file)
+  }
+  
+  # return the data from the file so it can be stored as a dataframe
+  return(species.gbif)
+}
+
+
+# Using function above to obtain puma data
+species1_gbif <- get_species_gbif("puma", "concolor")
+```
+
+#### 1.2 Function to pull out latitude and longitude data
+
+```{r}
+#' Function to obtain lat and lon data from species gbif
+#' 
+#' @param data species gbif data
+#' 
+#' @return returns latitude and longitude coordinates
+
+get_species_coords <- function(data) {
+
+  # Add latitude and longitude data to dataframe and omit any NAs
+  species_coords <- cbind(data$lon, data$lat) %>% 
+    na.omit() %>% 
+    data.frame()
+  
+  colnames(species_coords) <- c("lon", "lat")
+  
+  return(species_coords)
+}
+
+# Using function above to obtain species coordinates
+species1_coords <- get_species_coords(species1_gbif)
+```
+
+#### 1.3 Function to filter spatial data within specified latitude and longitude
+
+```{r}
+#' Function to trim coordinates within specified latitude and longitude
+#' 
+#' @param data dataframe containing species coordinates
+#' @param latmin minimum latitude value
+#' @param latmax maximum latitude value
+#' @param lonmim minimum longitude value
+#' @param lonmax maximum longitude value
+#' 
+#' @return trimmed coordinates within the specified boundaries
+
+
+trim_coords <- function(data, latmin, latmax, lonmin, lonmax) {
+  data[data$lon >= lonmin & data$lon <= lonmax & 
+         data$lat >= latmin & data$lat <= latmax, ]
+}
+
+# Use function above to trim data:
+species1_coords_trim <- trim_coords(species1_coords,
+                                   latmin = 24,
+                                   latmax = 84,
+                                   lonmin = -141,
+                                   lonmax = -64)
+
+# Plot trimmed data:
+# plot(wrld_simpl, 
+     #xlim = range(species1_coords_trim$lon),
+     #ylim = range(species1_coords_trim$lat),
+     #axes = TRUE,
+     #col = "light yellow")
+# points(species1_coords_trim, col = "red", cex = 0.4)
+```
+
+#### 1.4 Model species current distribution based on climatic variables
+
+```{r}
+# Download the bioclimatic data from the WorldClim database and name the 19 bioclimatic variables
+bio.data <- worldclim_global(var = "bio", res = 10, path = here())
+names(bio.data) <- paste0("bio", 1:19)
+
+# Define the study extent for species 1 with a buffer of +/- 5 degrees
+study_extent <- extent(
+  min(species1_coords_trim$lon) - 5,
+  max(species1_coords_trim$lon) + 5,
+  min(species1_coords_trim$lat) - 5,
+  max(species1_coords_trim$lat) + 5
+)
+
+# Create a mask from the world map for the study region, essentially filtering the map 
+mask <- rasterize(wrld_simpl, raster(study_extent, res=0.5))
+
+# Generate 500 random background coordinates within the study region
+bg <- randomPoints(mask, 500, ext=study_extent)
+colnames(bg) <- c("lon", "lat")
+
+# Combine presence and background coordinates into a dataframe
+train <- rbind(species1_coords_trim, bg)
+
+# Create a vector of 1s and 0s to indicate presence/absence for training data
+# Coordinates where species is present (p) are assigned "1"
+# Coordinates where species is absent are (b) assigned "0"
+pb_train <- c(rep(1, nrow(species1_coords_trim)), rep(0, nrow(bg)))
+
+# Extract the bioclimatic data for the presence and background points
+# Extract function obtains climate data for each coordinate in the training dataset
+# Combine the presence and absence labels from with the climate data for each coordinate
+species1_envtrain <- extract(bio.data, train)
+species1_envtrain <- data.frame(cbind(pa = pb_train, species1_envtrain))
+species1_envtrain <- na.omit(species1_envtrain)
+```
+
+#### 1.5 Function to compare which set of climatic variables best explain the data
+
+```{r}
+#' Function which generates every possible glm using specified bioclimatic variables with the aim of establishing which model (and therefore variables) best explains the presence and absence data for a species. The Akaike information criterion (AIC) is calculated for each model and is used as the indicator for the quality of the model. AIC values are compared and the lowest value and its model is outputted.
+#' 
+#' @param data dataframe containing presence and absence data, and bioclimatic data
+#' @param response_variable presence/absence data from dataframe which changes in response to bioclimatic variables
+#' @param climatic_variables selection of the 19 climatic variables chosen to explain p/a
+#' 
+#' @return the combination of bioclimatic variables which generates the best fitting model with the lowest AIC
+
+compare_bioclim_models <- function(data, response_variable, climatic_variables) {
+  
+  # Create a list to store AIC values for each model
+  model_results <- list()
+  
+  # Loop through all possible combinations of bioclimatic variables
+  for (i in 1:length(climatic_variables)) {
+    
+    # Generate all possible combinations of climatic variables and return as list
+    possible_combinations <- combn(climatic_variables, i, simplify = FALSE)
+    
+    # Loop through each combination stored in the list
+    for (combination in possible_combinations) {
+      
+      # Build the formula for the linear model using each combination
+      # Concatenate each variable with a "+" between
+      formula <- as.formula(paste(response_variable, "~", paste(combination, collapse = " + ")))
+      
+      # Fit the model using the dataframe specified
+      model <- glm(formula, family = binomial(link = "logit"), data = data)
+      
+      # Store the model and AIC value in the list created earlier
+      model_results[[paste(combination, collapse = " + ")]] <- AIC(model)
+    }
+  }
+  
+  # Convert results to a data frame
+  model_results <- data.frame(
+    model = names(model_results),
+    aic = unlist(model_results),
+    stringsAsFactors = FALSE)
+  
+  # Find the best model (lowest AIC)
+  best_model <- model_results[which.min(model_results$aic), ]
+  
+  return(best_model)
+}
+
+# Define which set of climatic variables should be used by the function to generate the models
+climatic_variables <- c("bio1", "bio2", "bio3", "bio4", "bio5")
+
+# Run the model comparison function
+best_model <- compare_bioclim_models(species1_envtrain, "pa", climatic_variables)
+
+print(best_model)
+```
+
+#### 1.6 Fit logistic regression
+
+```{r}
+# Run and store the GLM for the combination of climatic variables which best explain the distribution
+gm1 <- glm(pa ~ bio1 + bio4 + bio5,
+           family = binomial(link = "logit"), data = species1_envtrain)
+
+summary(gm1)
+```
+
+#### 1.7 Predict species distribution from the model
+
+```{r}
+# Using the model identified previously, predict the probability of occurrence of the species
+# across the whole of the area being considered
+pg1 <- predict(bio.data, gm1, ext = study_extent, type = "response")
+pg1 <- crop(pg1, study_extent)
+
+# pg is a raster layer representing the probability of occurrence from the selected linear model (gm1), for the area of extent.
+
+# Plot this
+plot(pg1, main = "GLM probability of occurrence of Puma concolor")
+# Add country boundaries
+plot(wrld_simpl, add = TRUE, border = "dark grey")
+# Add observed locality gbif data
+points(species1_coords_trim, col="red", pch=20, cex=0.5)
+
+```
+
+The graph above shows the predicted occurrence of *Puma concolor* based on the linear model using the selected bioclimatic variables. The probability values of each cell (coordinate) of the raster layer are represented using a colour gradient: high probability of occurrence shown in yellow and low probability of occurrence shown in blue.
+
+To generate this graph, species spatial data was taken from the GBIF database (represented as red points) and environmental data for each cell was obtained from the WorldClim database. The species spatial data and climate data were both filtered (or masked) for the study area of the USA and Canada. A training dataframe was used to generate presence and absence information for the species by combining the spatial data (presence) with random background points (absence), and also the environmental data for each point. The bioclimatic variables which best explain the species spatial data were then selected using the AIC - bio1, bio4, and bio5. This information was then used to train a general linear model to predict the probability of species occurrence, based on the bioclimatic variables selected, at any coordinate with environmental data.
+
+The predicted occurrence data seems quite plausible, with areas of highest probability corresponding with areas containing high densities of species observation points. Furthermore, the textbook Felines of the World (Bellani, 2019) has the contemporary populations of the North American Cougar as Eastern USA, Southeastern Canada, and Florida. It also denotes the rest of the USA and other Southern parts of Canada as regions with severely reduced or extinct populations. Therefore, it is plausible that the climate in Central and Western USA could be suitable for cougar populations and lack of observations in these areas could be due to other factors like incomplete sampling or population reductions caused by anthropogenic activities.
+
+#### 1.8 Using thresholds
+
+```{r}
+# Can use probability thresholds to generate a single map of distribution. The threshold provides a cutoff which differentiates predicted presence (above threshold) and absence (below threshold)
+
+# Evaluate how well the model predicts presence/absence at each point
+
+# Extract bioclimatic data for known presence points
+species1_testpres <- data.frame(extract(bio.data, species1_coords_trim))
+# Extract bioclimatic data for known absence points
+species1_testbackg <- data.frame(extract(bio.data, bg))
+
+# Evaluate function compares presence/absence data with the models predictions
+ge1 <- evaluate(species1_testpres, species1_testbackg, gm1)
+print(ge1)
+
+# The output gives several metrics such as:
+# Area Under the Curve: AUC, and correlation coefficient between observed and predicted.
+# Higher values of both metrics = better match between model predictions and observed
+# presence/absences.
+
+# Use the evaluation results to determine an optimal threshold value that best separates predicted presence from absence
+# The threshold is based on a chosen method ("prevalence") that minimizes prediction errors
+tr1 <- threshold(ge1, "prevalence")
+plot(pg1 > tr1, main = "Puma presence/absence prediction")
+plot(wrld_simpl, add = TRUE, border = "dark grey")
+points(species1_coords_trim, col="red", pch=20, cex=0.5)
+```
+
+This graph shows shows a binary presence/absence for the North American Cougar based on a threshold value from the GLM. The threshold value is generated by the evaluate function which compares presence/absence data with the models predictions. The extent of the species presence matches the textbook extent, and suggests that the rigour provided by the threshold is necessary. However, regions within the extent are showing that the cougar is absent which suggests the model is underperforming. It again backs up the idea that regions shown as absent but contain data points likely contain highly reduced cougar populations.
+
+## 2. Species 2 Distribution modelling - Alces alces
+
+#### 2.1 Access species records and filter data
+
+```{r}
+
+# Access species records from GBIF
+species2_gbif <- get_species_gbif("alces", "alces")
+
+# Pull out latitude and longitude data
+species2_coords <- get_species_coords(species2_gbif)
+
+# Filter spatial data within specified latitude and longitude
+species2_coords_trim <- trim_coords(species2_coords,
+                                   latmin = 24,
+                                   latmax = 84,
+                                   lonmin = -141,
+                                   lonmax = -64)
+```
+
+#### 2.2 Model species current distribution based on climatic variables
+
+```{r}
+# Define study extent with buffer
+study_extent <- extent(
+  min(species2_coords_trim$lon) - 5,
+  max(species2_coords_trim$lon) + 5,
+  min(species2_coords_trim$lat) - 5,
+  max(species2_coords_trim$lat) + 5
+)
+
+# Create a mask from the world map for the study region
+mask <- rasterize(wrld_simpl, raster(study_extent, res=0.5))
+
+# Generate 500 random background points within the study region
+bg <- randomPoints(mask, 500, ext=study_extent)
+colnames(bg) <- c("lon", "lat")
+
+# Combine presence and background coordinates into a dataframe
+species2_train <- rbind(species2_coords_trim, bg)
+
+# Create a vector of 1s and 0s to indicate presence/absence for training data
+# Coordinates where species is present (p) are assigned "1"
+# Coordinates where species is absent are (b) assigned "0"
+species2_pb_train <- c(rep(1, nrow(species2_coords_trim)), rep(0, nrow(bg)))
+
+# Extract the bioclimatic data for the presence and background points
+# Extract function obtains climate data for each coordinate in the training dataset
+# Combine the presence and absence labels from with the climate data for each coordinate
+species2_envtrain <- extract(bio.data, species2_train)
+species2_envtrain <- data.frame(cbind(pa = species2_pb_train, species2_envtrain))
+species2_envtrain <- na.omit(species2_envtrain)
+```
+
+#### 2.3 Compare which set of climatic variables best explain the data
+
+```{r}
+# Run the model comparison function
+# AIC values are compared and the lowest value and its model is outputted
+best_model <- compare_bioclim_models(species2_envtrain, "pa", climatic_variables)
+
+print(best_model)
+```
+
+#### 2.4 Fit logistic regression
+
+```{r}
+# Run and store the GLM for the combination of climatic variables which best explain the distribution
+gm2 <- glm(pa ~ bio2 + bio3 + bio4 + bio5,
+           family = binomial(link = "logit"), data = species2_envtrain)
+
+summary(gm2)
+```
+
+#### 2.5 Predict species distribution from model
+
+```{r}
+
+# Using the model identified previously, predict the probability of occurrence of the species
+# across the whole of the area being considered
+pg2 <- predict(bio.data, gm2, ext = study_extent, type = "response")
+pg2 <- crop(pg2, study_extent)
+
+# pg is a raster layer representing the probability of occurrence from the selected linear model (gm2), for the area of extent.
+
+# Plot this
+plot(pg2, main = "GLM probability of occurrence of Alces alces")
+# Add country boundaries
+plot(wrld_simpl, add = TRUE, border = "dark grey")
+# Add our observed gbif locality data
+points(species2_coords_trim, col="red", pch=20, cex=0.5)
+```
+
+The graph above shows the predicted occurrence of *Alces alces* based on the linear model using the selected bioclimatic variables. The probability values of each cell (coordinate) of the raster layer are represented using a colour gradient: high probability of occurrence shown in yellow and low probability of occurrence shown in blue. The graph was generated using the same methods as for species 1, though used bio2, bio3, bio4, and bio5 variables as predictors.
+
+The predicted occurrence data does not seem plausible for the moose as the predicted range covers a much larger area than the species observation points. It also directly contradicts well established moose range data which has moose limited to Canada, Alaska, and several northern and western US states (Jensen et al, 2018). This suggests that the predictive model is flawed and there could be several reasons for this. Firstly, the bioclimatic variables selected are not the best factor for explaining distribution. Secondly, there are non-climatic factors which are important for limiting moose distribution. Thirdly, the study area was too large and there was too much variation in climate sampled by the background points. Furthermore, there could have been sampling biases within the GBIF dataset which favoured areas populated by humans and missed more remote moose populations.
+
+#### 2.6 Using thresholds
+
+```{r}
+# Can use probability thresholds to generate a single map of distribution. The threshold provides a cutoff which differentiates predicted presence (above threshold) and absence (below threshold)
+
+# Evaluate how well the model predicts presence/absence at each point
+
+# Extract bioclimatic data for known presence points
+species2_testpres <- data.frame(extract(bio.data, species2_coords_trim))
+# Extract bioclimatic data for known absence points
+species2_testbackg <- data.frame(extract(bio.data, bg))
+
+# Evaluate function compares presence/absence data with the models predictions
+ge2 <- evaluate(species2_testpres, species2_testbackg, gm2)
+print(ge2)
+
+# The output gives several metrics such as:
+# Area Under the Curve: AUC, and correlation coefficient between observed and predicted.
+# Higher values of both metrics = better match between model predictions and observed
+# presence/absences.
+
+# Use the evaluation results to determine an optimal threshold value that best separates predicted presence from absence
+# The threshold is based on a chosen method ("prevalence") that minimizes prediction errors
+tr2 <- threshold(ge2, "prevalence")
+plot(pg2 > tr2, main = "Moose presence/absence")
+plot(wrld_simpl, add = TRUE, border = "dark grey")
+points(species2_coords_trim, col="red", pch=20, cex=0.5)
+```
+
+This graph shows shows a binary presence/absence for the moose based on a threshold value from the GLM. The threshold value is generated by the evaluate function which compares presence/absence data with the models predictions. Similar to the previous model, the presence/absence data is not matching the known species distribution and suggests the model is intrinsically flawed. Furthermore, a possible hypothesis could be that climate change has altered the most suitable areas for moose populations and moose populations have yet to move, or are unable to move, to these areas.
+
+## 3. Distribution Overlap
+
+Plot overlap:
+
+```{r}
+species1_glm <- glm(pa ~ bio1 + bio4 + bio5,
+                family = binomial(link = "logit"), data = species1_envtrain)
+
+species2_glm <- glm(pa ~ bio2 + bio3 + bio4 + bio5,
+                 family = binomial(link = "logit"), data = species2_envtrain)
+
+# Define study extent based on coordinates from both species
+study_extent <- extent(c(
+  min(c(species2_coords_trim$lon, species1_coords_trim$lon)),
+  max(c(species2_coords_trim$lon, species1_coords_trim$lon)),
+  min(c(species2_coords_trim$lat, species1_coords_trim$lat)),
+  max(c(species2_coords_trim$lat, species1_coords_trim$lat))
+))
+
+# Predict species distribution for both species within the study extent
+species2_pred <- predict(bio.data, species2_glm, ext = study_extent, type = "response")
+species1_pred <- predict(bio.data, species1_glm, ext = study_extent, type = "response")
+
+
+# Convert the predicted distribution (SpatRaster) for each species into RasterLayer format for easier processing
+# Crop to the study extent
+species2_pred_raster <- raster(species2_pred)
+species2_pred_raster <- crop(species2_pred_raster, study_extent)
+species1_pred_raster <- raster(species1_pred)
+species1_pred_raster <- crop(species1_pred_raster, study_extent)
+
+# Use overlay function from dismo package
+# Overlay function multiplies the probability values from the two rasters together to generate probabilities for overlapping presence
+overlap <- overlay(species2_pred_raster, species1_pred_raster, fun = function(m, p) m * p)
+
+# Plot result
+plot(overlap, main = "Moose & Puma Distribution Overlap", col = viridis::viridis(100))
+plot(wrld_simpl, add = TRUE, border = "dark grey")
+```
+
+The above graph shows the possible overlapping distributions of moose and puma. This is achieved my using the models for both species and multiplying the probabilities for each species at each coordinate together to generate probabilities of co-occurrence. High co-occurrence is show in yellow and low co-occurrence is shown in blue. This graph suggests a very high degree in overlap in species occurrence which would support a high degree of interspecific interaction like predation. However, this graph is based on a likely flawed moose distribution and so is probably not indicative of true co-occurrence data.
+
+Quantifying distribution overlap:
+
+The `dismo` package has a function called nicheOverlap which can compute the degree of species overlap from predictions of species distributions. This is done using two similarity indexes which can quantify the overlap - Schoener's D and Warren's I. Both values are between 0 and 1 and 1 represents complete overlap. The values below suggest that the species have a moderately high degree of niche overlap due to similar environmental requirements but may not be using the same areas equally.
+
+```{r}
+# Perform Schoener's D
+niche_overlap_schoener <- nicheOverlap(species1_pred_raster, species2_pred_raster, stat = "D")
+print(niche_overlap_schoener)
+
+# Perform Warren's I
+niche_overlap_warren <- nicheOverlap(species1_pred_raster, species2_pred_raster, stat = "I")
+print(niche_overlap_warren)
+```
+
+## 4. Interspecies Distribution Dependence
+
+To test whether the distribution of species 1 depends on the distribution of species 2, whilst also accounting for bioclimatic variables, a linear model must be performed. The model must be trained on a dataset which contains presence data for both species as well as the climate data for each of the points.
+
+The model suggests that there is a strong inverse relationship between the two species (species2_presence estimate is negative, p\<2e-16). This is in direct contradiction to the spatial models that suggest overlap. This may be because the linear model makes global predictions based on specific sample points, and there may not have been enough sample points. Also, the use of a linear model makes assumptions about the linearity of the climatic predictors and species presence data. Spatial models are designed to account for heterogeneity and so the previous predictions are more likely to be accurate. In relation to the climatic variables, the model suggests bio2, bio3, bio4, and bio5 have a strong influence on species 1 distribution.
+
+```{r}
+
+# Add a column to the environmental data to identify which species the data is from
+species2_envtrain$species <- "species2"
+species1_envtrain$species <- "species1"
+
+# Combined the two environmental training dataframes
+combined_envtrain <- rbind(species2_envtrain, species1_envtrain)
+
+# Create two new columns based on presence and species
+
+# This column indicates whether species 2 is present at the point
+# If species 2 is present add 1 to column, else 0
+combined_envtrain$species2_presence <- ifelse(combined_envtrain$species == "species2" & combined_envtrain$pa == 1, 1, 0)
+
+# This column indicates whether species 1 is present at the point
+# If species 1 is present add 1 to column, else 0
+combined_envtrain$species1_presence <- ifelse(combined_envtrain$species == "species1" & combined_envtrain$pa == 1, 1, 0)
+
+# Fit a linear model to investigate the relationship between species presence and environmental variables
+# The model predicts the presence of species 1 based on the presence of species 2 and environmental variables
+overlap_lm <- lm(species1_presence ~ species2_presence + bio1 + bio2 + bio3 + bio4 + bio5, data = combined_envtrain)
+
+summary(overlap_lm)
+
+```
+
+## 5. Future Distribution Prediction
+
+#### 5.1 Moose future distribution:
+
+```{r}
+# Download future bioclimatic data from CMIP6 databased
+future.bio.data <- cmip6_world(
+  model = "CanESM5", # Climate model
+  var = "bio", # Bioclimatic variables
+  ssp = "245", # Emmissions scenario
+  res = 10,
+  time = "2061-2080", # Time period
+  path = here()
+)
+
+# Match the names of the bioclimatic variables
+names(future.bio.data) <- names(bio.data)
+
+# Predict future distribution for species 2 using the current glm
+species2_future <- predict(future.bio.data, species2_glm, ext = study_extent, type = "response")
+species2_future <- crop(species2_future, study_extent)
+
+plot(species2_future, main = "GLM probability of future occurrence of Alces alces, 2060-2081")
+plot(wrld_simpl, add = TRUE, border = "dark grey")
+points(species2_coords_trim, col = "black", pch = 4, cex = 0.5) # Points of current sightings
+```
+
+The graph above shows the predicted future occurrence of *Alces alces* based on the linear model using the selected bioclimatic variables from the **future bioclimatic dataset**. The probability values of each cell (coordinate) of the raster layer are represented using a colour gradient: high probability of occurrence shown in yellow and low probability of occurrence shown in blue. Points of observaations are shown in black,
+
+To generate this graph, future distributions were predicted based on linear models trained on present-day distribution data.
+
+The graph shows changes to the range when compared with the present day occurrence. Future occurrence probabilities are reduced in several areas of the USA, particularly the central region. However, future occurrence probabilities have increased in some regions of northern Canada. This suggests that the climatic variables differ enough in the future to reduce favourability of those areas to the moose.
+
+#### 5.2 Puma future distribution:
+
+```{r}
+# Predict future distribution for species 1 using the current glm
+species1_future <- predict(future.bio.data, species1_glm, ext = study_extent, type = "response")
+species1_future <- crop(species1_future, study_extent)
+
+
+plot(species1_future, main = "GLM probability of future occurrence of Puma concolor, 2060-2081")
+plot(wrld_simpl, add = TRUE, border = "dark grey")
+points(species1_coords_trim, col = "black", pch = 4, cex = 0.5)
+```
+
+The graph above shows the predicted future occurrence of *Puma concolor* based on the linear model using the selected bioclimatic variables from the **future bioclimatic dataset**. The probability values of each cell (coordinate) of the raster layer are represented using a colour gradient: high probability of occurrence shown in yellow and low probability of occurrence shown in blue. Points of observaations are shown in black,
+
+To generate this graph, future distributions were predicted based on linear models trained on present-day distribution data.
+
+The graph shows changes to the range when compared with the present day occurrence. Future occurrence seems to have expanded in some regions in eastern USA and to have contracted slightly in some regions of central USA. These distributions are less pronounced that with the moose. This may be because the cougar is already distributed over an extremely wide range of habitats and so is able to tolerate most changes in climate.
+
+#### 5.3 Future overlap:
+
+```{r}
+# Convert SpatRaster to RasterLayer
+species2_future_raster <- raster(species2_future)
+species1_future_raster <- raster(species1_future)
+
+# Use dismo overlay function to multiply raster probability values
+future_overlap <- overlay(species2_future_raster, species1_future_raster, fun = function(m, p) m * p)
+
+# Plot result
+plot(future_overlap, main = "Moose & Puma Distribution Overlap", col = viridis::viridis(100))
+plot(crop(wrld_simpl, study_extent), add = TRUE, border = "dark grey")
+```
+
+The above graph shows the possible overlapping distributions of moose and puma under the future climate change scenario. High co-occurrence is show in yellow and low co-occurrence is shown in blue. This graph suggests a very high degree in overlap in species occurrence which would support a high degree of interspecific interaction like predation. However, this graph is based on a likely flawed moose distribution and so is probably not indicative of true co-occurrence data.
+
+#### 5.4 Quantifying future distribution overlap:
+
+The values below again suggest that the species have a moderately high degree of niche overlap due to similar environmental requirements but may not be using the same areas equally. They are extremely similar to the present day values and suggest the changes in overlap due to climate change are very limited.
+
+```{r}
+# Perform Schoener's D
+future_niche_overlap_schoener <- nicheOverlap(species1_future_raster, species2_future_raster, stat = "D")
+print(future_niche_overlap_schoener)
+
+# Perform Warren's I
+future_niche_overlap_warren <- nicheOverlap(species1_future_raster, species2_future_raster, stat = "I")
+print(future_niche_overlap_warren)
+```
+
+## Evaluation
+
+As mentioned previously, the bioclimatic variables selected do not seem to be very good predictors of moose distribution - they are overestimating it. It would therefore be prudent to repeat with other combinations of variables, or to look for other factors which significantly limit the moose's range. The high degree of overlap between cougar and moose ranges is not expected, as cougars are widely-distributed, opportunistic predators which have an extremely varied diet. It would therefore be expected that there would be relatively high dependence in areas in which the two species overlap, but not for the entire range.
+
+## References
+
+Bellani, G. G. (2020). Chapter 5 - Subfamily Felinae. Felines of the World. G. G. Bellani, Academic Press: 145-308.
+
+Jensen, W. F., Smith, J. R., Carstensen, M., Penner, C. E., Hosek, B. M., & Maskey, Jr., J. J. (2018). EXPANDING GIS ANALYSES TO MONITOR AND ASSESS NORTH AMERICAN MOOSE DISTRIBUTION AND DENSITY. *Alces*, *54*, 45–54. Retrieved from https://alcesjournal.org/index.php/alces/article/view/228
